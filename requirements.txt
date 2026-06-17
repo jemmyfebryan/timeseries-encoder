@@ -1,0 +1,15 @@
+# Core dependencies
+torch>=2.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# TensorBoard for logging
+tensorboard>=2.13.0
+
+# Progress bars (optional, for training)
+tqdm>=4.65.0
+
+# Type hints and linting (optional, for development)
+# mypy>=1.3.0
+# black>=23.3.0
+# flake8>=6.0.0
