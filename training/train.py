@@ -123,18 +123,24 @@ class Trainer:
         batch: Tuple,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Single training step.
+        Single training step with adaptive margins for soft labels.
 
         Args:
-            batch: Tuple of (anchor_feat, pos_feat, neg_feat, ...)
+            batch: Tuple of (anchor_feat, pos_feat, neg_feat, targets...)
 
         Returns:
-            Tuple of (return_loss, volatility_loss, total_loss)
+            Tuple of (return_loss, volatility_loss, total_loss, ...)
         """
-        # Unpack batch
+        # Unpack batch (includes target values now)
         anchor_feat, pos_feat, neg_feat = batch[0], batch[1], batch[2]
+        anchor_return_tgt = batch[3].to(self.device)
+        pos_return_tgt = batch[4].to(self.device)
+        neg_return_tgt = batch[5].to(self.device)
+        anchor_vol_tgt = batch[6].to(self.device)
+        pos_vol_tgt = batch[7].to(self.device)
+        neg_vol_tgt = batch[8].to(self.device)
 
-        # Move to device
+        # Move features to device
         anchor_feat = anchor_feat.to(self.device)
         pos_feat = pos_feat.to(self.device)
         neg_feat = neg_feat.to(self.device)
@@ -144,20 +150,37 @@ class Trainer:
         pos_return_emb, pos_vol_emb = self.model(pos_feat)
         neg_return_emb, neg_vol_emb = self.model(neg_feat)
 
-        # Compute losses
-        return_loss = self.return_criterion(anchor_return_emb, pos_return_emb, neg_return_emb)
-        volatility_loss = self.volatility_criterion(anchor_vol_emb, pos_vol_emb, neg_vol_emb)
+        # Compute embedding distances
+        pos_return_dist = 1 - torch.sum(anchor_return_emb * pos_return_emb, dim=1)
+        neg_return_dist = 1 - torch.sum(anchor_return_emb * neg_return_emb, dim=1)
+        pos_vol_dist = 1 - torch.sum(anchor_vol_emb * pos_vol_emb, dim=1)
+        neg_vol_dist = 1 - torch.sum(anchor_vol_emb * neg_vol_emb, dim=1)
+
+        # Compute adaptive margins based on target distances
+        return_margin = torch.clamp(
+            1.0 + torch.tanh((torch.abs(anchor_return_tgt - pos_return_tgt) +
+                               torch.abs(anchor_return_tgt - neg_return_tgt)) / 2.0),
+            min=0.2, max=1.8
+        )
+
+        vol_margin = torch.clamp(
+            1.0 + torch.tanh((torch.abs(anchor_vol_tgt - pos_vol_tgt) +
+                               torch.abs(anchor_vol_tgt - neg_vol_tgt)) / 2.0),
+            min=0.2, max=1.8
+        )
+
+        # Compute losses with adaptive margins
+        return_loss = torch.clamp(
+            pos_return_dist - neg_return_dist + return_margin,
+            min=0.0
+        ).mean()
+
+        volatility_loss = torch.clamp(
+            pos_vol_dist - neg_vol_dist + vol_margin,
+            min=0.0
+        ).mean()
 
         total_loss = return_loss + volatility_loss
-
-        # Compute distances for monitoring
-        # Positive distance: anchor to positive
-        pos_return_dist = 1 - torch.sum(anchor_return_emb * pos_return_emb, dim=1).mean()
-        pos_vol_dist = 1 - torch.sum(anchor_vol_emb * pos_vol_emb, dim=1).mean()
-
-        # Negative distance: anchor to negative
-        neg_return_dist = 1 - torch.sum(anchor_return_emb * neg_return_emb, dim=1).mean()
-        neg_vol_dist = 1 - torch.sum(anchor_vol_emb * neg_vol_emb, dim=1).mean()
 
         # Backward pass
         self.optimizer.zero_grad()
@@ -172,10 +195,10 @@ class Trainer:
             return_loss,
             volatility_loss,
             total_loss,
-            pos_return_dist,
-            pos_vol_dist,
-            neg_return_dist,
-            neg_vol_dist,
+            pos_return_dist.mean(),
+            pos_vol_dist.mean(),
+            neg_return_dist.mean(),
+            neg_vol_dist.mean(),
         )
 
     @torch.no_grad()

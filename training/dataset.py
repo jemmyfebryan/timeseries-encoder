@@ -1,8 +1,8 @@
 """
-Triplet dataset module.
+Triplet dataset module with soft continuous similarity labels.
 
-Implements efficient triplet sampling for Siamese training.
-Supports multiple strategies: binning, random, and hard negative mining.
+Implements efficient triplet sampling with continuous similarity weights
+to preserve ordinal relationships instead of hard binary binning.
 """
 
 import numpy as np
@@ -295,10 +295,16 @@ class TripletDataset(Dataset):
             strategy: Optional mining strategy (defaults to BinningStrategy)
         """
         self.features = torch.from_numpy(features).float()
+        self.return_targets_np = return_targets  # Keep numpy version for distance calculations
         self.return_targets = torch.from_numpy(return_targets).float()
+        self.volatility_targets_np = volatility_targets
         self.volatility_targets = torch.from_numpy(volatility_targets).float()
         self.asset_ids = asset_ids
         self.config = config
+
+        # Store target ranges for normalization
+        self.return_range = return_targets.max() - return_targets.min()
+        self.vol_range = volatility_targets.max() - volatility_targets.min()
 
         # Initialize strategy
         if strategy is None:
@@ -312,7 +318,7 @@ class TripletDataset(Dataset):
         self.strategy = strategy
 
         # Pre-compute triplets
-        logger.info("Mining triplets...")
+        logger.info("Mining triplets with continuous similarity...")
         self.anchor_idx, self.positive_idx, self.negative_idx = self.strategy.mine_triplets(
             features,
             return_targets,
@@ -325,6 +331,48 @@ class TripletDataset(Dataset):
     def __len__(self) -> int:
         """Return number of triplets."""
         return len(self.anchor_idx)
+
+    def compute_adaptive_margins(
+        self,
+        anchor_return_targets: torch.Tensor,
+        positive_return_targets: torch.Tensor,
+        negative_return_targets: torch.Tensor,
+        anchor_vol_targets: torch.Tensor,
+        positive_vol_targets: torch.Tensor,
+        negative_vol_targets: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute adaptive margins based on target distances.
+
+        Args:
+            All target tensors (B,)
+
+        Returns:
+            Tuple of (return_adaptive_margin, vol_adaptive_margin) each (B,)
+        """
+        # Compute target distances
+        pos_return_dist = torch.abs(anchor_return_targets - positive_return_targets)
+        neg_return_dist = torch.abs(anchor_return_targets - negative_return_targets)
+
+        pos_vol_dist = torch.abs(anchor_vol_targets - positive_vol_targets)
+        neg_vol_dist = torch.abs(anchor_vol_targets - negative_vol_targets)
+
+        # Adaptive margin: closer targets → smaller margin
+        # Further apart targets → larger margin
+        base_margin = 1.0
+
+        # Normalize distances and apply to margin
+        return_adapt = pos_return_dist + neg_return_dist
+        vol_adapt = pos_vol_dist + neg_vol_dist
+
+        return_margin = base_margin + torch.tanh(return_adapt / 2.0)
+        vol_margin = base_margin + torch.tanh(vol_adapt / 2.0)
+
+        # Clamp to reasonable range
+        return_margin = torch.clamp(return_margin, min=0.2, max=1.8)
+        vol_margin = torch.clamp(vol_margin, min=0.2, max=1.8)
+
+        return return_margin, vol_margin
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, ...]:
         """
