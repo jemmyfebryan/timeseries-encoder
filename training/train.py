@@ -356,7 +356,7 @@ class Trainer:
 
     def load_checkpoint(self, filepath: Path) -> None:
         """
-        Load model checkpoint.
+        Load model checkpoint and continue from next epoch.
 
         Args:
             filepath: Path to checkpoint file
@@ -365,22 +365,25 @@ class Trainer:
 
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.current_epoch = checkpoint["epoch"]
+
+        # Checkpoint stores the last COMPLETED epoch
+        # Continue training from the NEXT epoch
+        self.current_epoch = checkpoint["epoch"] + 1
+
         self.best_val_loss = checkpoint["best_val_loss"]
 
         if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
         logger.info(f"Checkpoint loaded: {filepath}")
+        logger.info(f"Continuing training from epoch {self.current_epoch}")
 
     def train(self) -> None:
         """Run full training loop."""
         logger.info("Starting training...")
 
         for epoch in range(self.current_epoch, self.train_config.num_epochs):
-            self.current_epoch = epoch
-
-            # Train epoch
+            # Train this epoch
             train_metrics = self.train_epoch()
 
             # Validate
@@ -395,6 +398,10 @@ class Trainer:
                 f"Neg Dist: {((train_metrics['train_neg_return_dist'] + train_metrics['train_neg_vol_dist']) / 2):.3f} - "
                 f"Time: {train_metrics['epoch_time']:.1f}s"
             )
+
+            # Update current_epoch to represent the completed epoch
+            # Checkpoint will store this as "last completed epoch"
+            self.current_epoch = epoch
 
             # Log to TensorBoard
             self.writer.add_scalar("epoch/train_total_loss", train_metrics["train_total_loss"], epoch)
@@ -415,6 +422,7 @@ class Trainer:
             # Save checkpoint
             if (epoch + 1) % self.train_config.checkpoint_every == 0:
                 self.save_checkpoint(f"checkpoint_epoch_{epoch + 1}.pt")
+                logger.info(f"Checkpoint saved: checkpoint_epoch_{epoch + 1}.pt")
 
             # Check for improvement
             if val_metrics["val_total_loss"] < self.best_val_loss - self.train_config.min_delta:
