@@ -22,7 +22,7 @@ data_config = DataConfig(
     num_assets=128,
 
     # Window sizes
-    lookback_window=24,  # 12-hour input window
+    lookback_window=48,  # 12-hour input window
     future_window=24,    # 12-hour future window for targets
 
     # Data splits (per asset, chronological)
@@ -33,7 +33,7 @@ data_config = DataConfig(
     # Preprocessing
     use_log_returns=True,
     normalize_method="rolling_zscore",  # Options: "rolling_zscore", "none"
-    rolling_window=24,
+    rolling_window=48,
 
     # Minimum samples (skip assets with fewer samples)
     min_samples=100,
