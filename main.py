@@ -146,14 +146,14 @@ def main():
     data_loader = DataLoader(config.data)
     data_loader.load_all_assets()
 
-    if len(data_loader.assets) == 0:
-        logger.error("No assets loaded! Check data directory and file paths.")
-        return
-
-    # Get split data
+    # Get split data (streaming approach uses splits directly)
     train_data = data_loader.get_split_data("train")
     val_data = data_loader.get_split_data("val")
     test_data = data_loader.get_split_data("test")
+
+    if len(train_data[0]) == 0:
+        logger.error("No train data loaded! Check data directory and file paths.")
+        return
 
     logger.info(f"Train samples: {len(train_data[0]):,}")
     logger.info(f"Val samples: {len(val_data[0]):,}")
@@ -194,6 +194,7 @@ def main():
                 torch.load(
                     best_checkpoint,
                     map_location=config.training.device,
+                    weights_only=False,
                 )["model_state_dict"]
             )
         else:
@@ -210,6 +211,7 @@ def main():
                 torch.load(
                     checkpoint_path,
                     map_location=config.training.device,
+                    weights_only=False,
                 )["model_state_dict"]
             )
             logger.info(f"Loaded checkpoint: {checkpoint_path}")

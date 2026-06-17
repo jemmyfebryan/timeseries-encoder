@@ -64,3 +64,5 @@ Thumbs.db
 *.bak
 tmp/
 temp/
+
+processed_data/

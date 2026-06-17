@@ -86,7 +86,7 @@ class TripletConfig:
 
     # Mining parameters
     samples_per_asset: int = 100  # For offline mining
-    n_triplets: int = 10000  # Number of triplets per epoch
+    n_triplets: int = 5000  # Number of triplets per epoch (reduced for speed)
 
     def __post_init__(self):
         """Validate configuration."""
@@ -168,17 +168,26 @@ class Config:
 
     def __post_init__(self):
         """Create directories and set device."""
-        import torch
+        try:
+            import torch
+            # Set device based on availability
+            if self.training.device == "cuda" and not torch.cuda.is_available():
+                self.training.device = "cpu"
+        except ImportError:
+            self.training.device = "cpu"
 
         # Create directories
         Path(self.training.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         Path(self.training.tensorboard_dir).mkdir(parents=True, exist_ok=True)
         Path(self.inference.memory_bank_dir).mkdir(parents=True, exist_ok=True)
 
-        # Set device based on availability
-        if self.training.device == "cuda" and not torch.cuda.is_available():
-            self.training.device = "cpu"
 
+# Default configuration instance (lazy loaded)
+default_config = None
 
-# Default configuration instance
-default_config = Config()
+def get_default_config() -> Config:
+    """Get default configuration instance."""
+    global default_config
+    if default_config is None:
+        default_config = Config()
+    return default_config

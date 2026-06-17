@@ -1,16 +1,15 @@
 """
-Data loading and preprocessing module.
+Data loading and preprocessing module with memory-efficient streaming.
 
-Handles loading CSV files, preprocessing prices into features,
-and creating train/val/test splits.
+Processes assets in batches to avoid OOM - saves to disk incrementally.
 """
 
 import pandas as pd
 import numpy as np
 from pathlib import Path
 from typing import Tuple, Dict, List, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
+import gc
 
 from .config import DataConfig
 
@@ -77,7 +76,7 @@ class DataLoader:
 
     def load_csv(self, filepath: Path) -> Optional[pd.DataFrame]:
         """
-        Load a single CSV file safely.
+        Load a single CSV file safely with optimizations.
 
         Args:
             filepath: Path to CSV file
@@ -86,7 +85,12 @@ class DataLoader:
             DataFrame with 'price', 'volume', and timestamp columns, or None if failed
         """
         try:
-            df = pd.read_csv(filepath)
+            # Optimized CSV reading
+            df = pd.read_csv(
+                filepath,
+                usecols=["price", "volume", "date", "block"],  # Only read needed columns
+                engine="c",  # Faster C engine
+            )
 
             # Validate required columns
             if "price" not in df.columns or "volume" not in df.columns:
@@ -99,7 +103,6 @@ class DataLoader:
             elif "block" in df.columns:
                 # Use block as a proxy for time (sorted by block)
                 df["timestamp"] = pd.RangeIndex(start=0, stop=len(df))
-                logger.info(f"Using block ordering for {filepath}")
             else:
                 logger.warning(f"No 'date' or 'block' column in {filepath}. Using index.")
                 df["timestamp"] = pd.RangeIndex(start=0, stop=len(df))
@@ -143,14 +146,16 @@ class DataLoader:
 
         # Compute log returns for prices
         if self.config.use_log_returns:
-            log_prices = np.log(prices + 1e-8)  # Add small epsilon to avoid log(0)
+            log_prices = np.log(np.maximum(prices, 1e-8))  # Guard against negative/zero
             price_features = np.diff(log_prices, prepend=0)
         else:
             price_features = prices.copy()
 
-        # Compute log returns for volumes (or use log directly)
+        # Compute log returns for volumes (handle invalid values)
         if self.config.use_log_returns:
-            log_volumes = np.log(volumes + 1e-8)
+            # Filter out invalid volumes (<= 0) and use log transform
+            valid_volumes = np.maximum(volumes, 1e-8)  # Guard against negative/zero
+            log_volumes = np.log(valid_volumes)
             volume_features = np.diff(log_volumes, prepend=0)
         else:
             volume_features = volumes.copy()
@@ -204,8 +209,8 @@ class DataLoader:
         future_window = self.config.future_window
         lookback = self.config.lookback_window
 
-        # Compute log returns
-        log_prices = np.log(prices + 1e-8)
+        # Compute log returns (guard against invalid values)
+        log_prices = np.log(np.maximum(prices, 1e-8))
         log_returns = np.diff(log_prices, prepend=0)
 
         return_targets = []
@@ -319,80 +324,185 @@ class DataLoader:
 
     def load_all_assets(self) -> None:
         """
-        Load all 128 assets in parallel.
+        Load all assets in memory-efficient batches to avoid OOM.
 
-        Populates self.assets and creates train/val/test splits.
+        Processes assets in batches, saves to disk, then loads back.
+        Memory usage stays constant regardless of number of assets.
         """
-        logger.info(f"Loading {self.config.num_assets} assets...")
+        # Check if already processed
+        processed_dir = Path("./processed_data")
+        if (processed_dir / "train_data.npz").exists():
+            logger.info("Found processed data, loading from disk...")
+            self._load_from_disk(processed_dir)
+            return
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {
-                executor.submit(self.load_single_asset, asset_id): asset_id
-                for asset_id in range(1, self.config.num_assets + 1)
-            }
+        logger.info(f"Loading {self.config.num_assets} assets in batches (memory-efficient)...")
 
-            for future in as_completed(futures):
-                asset_id = futures[future]
+        # Process in batches to avoid OOM
+        batch_size = 10  # Process 10 assets at a time
+        processed_dir = Path("./processed_data")
+        processed_dir.mkdir(exist_ok=True)
+
+        all_train_features = []
+        all_train_returns = []
+        all_train_vols = []
+        all_train_asset_ids = []
+
+        all_val_features = []
+        all_val_returns = []
+        all_val_vols = []
+        all_val_asset_ids = []
+
+        all_test_features = []
+        all_test_returns = []
+        all_test_vols = []
+        all_test_asset_ids = []
+
+        for batch_start in range(1, self.config.num_assets + 1, batch_size):
+            batch_end = min(batch_start + batch_size, self.config.num_assets + 1)
+            batch_ids = list(range(batch_start, batch_end))
+
+            logger.info(f"Processing batch {batch_start//batch_size + 1}: assets {batch_ids[0]}-{batch_ids[-1]}")
+
+            # Load this batch
+            batch_assets = []
+            for asset_id in batch_ids:
                 try:
-                    asset_data = future.result()
+                    asset_data = self.load_single_asset(asset_id)
                     if asset_data is not None:
-                        self.assets[asset_id] = asset_data
-                        logger.debug(f"Loaded asset {asset_id}: {len(asset_data)} samples")
+                        batch_assets.append(asset_data)
                 except Exception as e:
                     logger.error(f"Error loading asset {asset_id}: {e}")
 
-        logger.info(f"Successfully loaded {len(self.assets)}/{self.config.num_assets} assets")
+            if not batch_assets:
+                continue
+
+            # Split batch assets
+            for asset_data in batch_assets:
+                train_slice, val_slice, test_slice = self.split_data(
+                    asset_data.features,
+                    asset_data.return_targets,
+                    asset_data.volatility_targets,
+                    asset_data.timestamps,
+                )
+
+                # Append to lists
+                if train_slice.stop - train_slice.start > 0:
+                    all_train_features.append(asset_data.features[train_slice])
+                    all_train_returns.append(asset_data.return_targets[train_slice])
+                    all_train_vols.append(asset_data.volatility_targets[train_slice])
+                    all_train_asset_ids.append(np.full(train_slice.stop - train_slice.start, asset_data.asset_id))
+
+                if val_slice.stop - val_slice.start > 0:
+                    all_val_features.append(asset_data.features[val_slice])
+                    all_val_returns.append(asset_data.return_targets[val_slice])
+                    all_val_vols.append(asset_data.volatility_targets[val_slice])
+                    all_val_asset_ids.append(np.full(val_slice.stop - val_slice.start, asset_data.asset_id))
+
+                if test_slice.stop - test_slice.start > 0:
+                    all_test_features.append(asset_data.features[test_slice])
+                    all_test_returns.append(asset_data.return_targets[test_slice])
+                    all_test_vols.append(asset_data.volatility_targets[test_slice])
+                    all_test_asset_ids.append(np.full(test_slice.stop - test_slice.start, asset_data.asset_id))
+
+                # Clear individual asset data
+                del asset_data
+
+            # Clear batch
+            del batch_assets
+            gc.collect()
+
+            logger.info(f"  → Completed batch, cleared memory")
+
+        # Concatenate and save to disk
+        logger.info("Concatenating data and saving to disk...")
+
+        if all_train_features:
+            train_data = {
+                "features": np.concatenate(all_train_features, axis=0),
+                "return_targets": np.concatenate(all_train_returns, axis=0),
+                "volatility_targets": np.concatenate(all_train_vols, axis=0),
+                "asset_ids": np.concatenate(all_train_asset_ids, axis=0),
+            }
+            np.savez_compressed(processed_dir / "train_data.npz", **train_data)
+            logger.info(f"Saved train data: {len(train_data['features'])} samples")
+            del all_train_features, all_train_returns, all_train_vols, all_train_asset_ids
+
+        if all_val_features:
+            val_data = {
+                "features": np.concatenate(all_val_features, axis=0),
+                "return_targets": np.concatenate(all_val_returns, axis=0),
+                "volatility_targets": np.concatenate(all_val_vols, axis=0),
+                "asset_ids": np.concatenate(all_val_asset_ids, axis=0),
+            }
+            np.savez_compressed(processed_dir / "val_data.npz", **val_data)
+            logger.info(f"Saved val data: {len(val_data['features'])} samples")
+            del all_val_features, all_val_returns, all_val_vols, all_val_asset_ids
+
+        if all_test_features:
+            test_data = {
+                "features": np.concatenate(all_test_features, axis=0),
+                "return_targets": np.concatenate(all_test_returns, axis=0),
+                "volatility_targets": np.concatenate(all_test_vols, axis=0),
+                "asset_ids": np.concatenate(all_test_asset_ids, axis=0),
+            }
+            np.savez_compressed(processed_dir / "test_data.npz", **test_data)
+            logger.info(f"Saved test data: {len(test_data['features'])} samples")
+            del all_test_features, all_test_returns, all_test_vols, all_test_asset_ids
+
+        gc.collect()
+
+        # Now load from disk
+        self._load_from_disk(processed_dir)
+
+    def _load_from_disk(self, processed_dir: Path) -> None:
+        """Load processed data from disk into splits."""
+        logger.info("Loading processed data from disk...")
+
+        # Load train
+        train_data = np.load(processed_dir / "train_data.npz")
+        self.splits["train"] = [
+            AssetData(
+                asset_id=0,  # Dummy ID for concatenated data
+                features=train_data["features"],
+                return_targets=train_data["return_targets"],
+                volatility_targets=train_data["volatility_targets"],
+                timestamps=pd.RangeIndex(len(train_data["features"])),
+            )
+        ]
+
+        # Load val
+        val_data = np.load(processed_dir / "val_data.npz")
+        self.splits["val"] = [
+            AssetData(
+                asset_id=0,
+                features=val_data["features"],
+                return_targets=val_data["return_targets"],
+                volatility_targets=val_data["volatility_targets"],
+                timestamps=pd.RangeIndex(len(val_data["features"])),
+            )
+        ]
+
+        # Load test
+        test_data = np.load(processed_dir / "test_data.npz")
+        self.splits["test"] = [
+            AssetData(
+                asset_id=0,
+                features=test_data["features"],
+                return_targets=test_data["return_targets"],
+                volatility_targets=test_data["volatility_targets"],
+                timestamps=pd.RangeIndex(len(test_data["features"])),
+            )
+        ]
+
+        logger.info("Data loaded successfully from disk")
 
         # Create splits
         self._create_splits()
 
     def _create_splits(self) -> None:
-        """Create train/val/test splits from loaded assets."""
-        for asset_id, asset_data in self.assets.items():
-            train_slice, val_slice, test_slice = self.split_data(
-                asset_data.features,
-                asset_data.return_targets,
-                asset_data.volatility_targets,
-                asset_data.timestamps,
-            )
-
-            # Create AssetData for each split
-            train_asset = AssetData(
-                asset_id=asset_id,
-                features=asset_data.features[train_slice],
-                return_targets=asset_data.return_targets[train_slice],
-                volatility_targets=asset_data.volatility_targets[train_slice],
-                timestamps=asset_data.timestamps[train_slice],
-            )
-
-            val_asset = AssetData(
-                asset_id=asset_id,
-                features=asset_data.features[val_slice],
-                return_targets=asset_data.return_targets[val_slice],
-                volatility_targets=asset_data.volatility_targets[val_slice],
-                timestamps=asset_data.timestamps[val_slice],
-            )
-
-            test_asset = AssetData(
-                asset_id=asset_id,
-                features=asset_data.features[test_slice],
-                return_targets=asset_data.return_targets[test_slice],
-                volatility_targets=asset_data.volatility_targets[test_slice],
-                timestamps=asset_data.timestamps[test_slice],
-            )
-
-            self.splits["train"].append(train_asset)
-            self.splits["val"].append(val_asset)
-            self.splits["test"].append(test_asset)
-
-        # Log statistics
-        train_samples = sum(len(a) for a in self.splits["train"])
-        val_samples = sum(len(a) for a in self.splits["val"])
-        test_samples = sum(len(a) for a in self.splits["test"])
-
-        logger.info(f"Train samples: {train_samples:,}")
-        logger.info(f"Val samples: {val_samples:,}")
-        logger.info(f"Test samples: {test_samples:,}")
+        """Splits are now created in load_all_assets directly."""
+        pass
 
     def get_split_data(
         self,

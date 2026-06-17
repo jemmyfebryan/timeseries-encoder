@@ -126,7 +126,7 @@ def load_model(
         filepath: Checkpoint path
         device: Device to load to
     """
-    state_dict = torch.load(filepath, map_location=device)
+    state_dict = torch.load(filepath, map_location=device, weights_only=False)
     model.load_state_dict(state_dict)
 
 

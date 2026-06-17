@@ -84,34 +84,46 @@ class BinningStrategy(TripletMiningStrategy):
         asset_ids: np.ndarray,
         n_triplets: int
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Mine triplets using binning strategy."""
+        """Mine triplets using optimized binning strategy."""
         n_samples = len(return_targets)
 
         # Create bins for return and volatility
         return_bins = self._create_bins(return_targets)
         vol_bins = self._create_bins(volatility_targets)
 
-        # Group samples by bins
-        return_bin_groups: Dict[int, List[int]] = {}
-        vol_bin_groups: Dict[int, List[int]] = {}
+        # Convert to numpy arrays for faster operations
+        return_bins_array = np.array(return_bins)
+        vol_bins_array = np.array(vol_bins)
+        asset_ids_array = np.array(asset_ids)
 
-        for i in range(n_samples):
-            r_bin = return_bins[i]
-            v_bin = vol_bins[i]
+        # Build bin groups using numpy (much faster than Python loops)
+        return_bin_groups: Dict[int, np.ndarray] = {}
+        vol_bin_groups: Dict[int, np.ndarray] = {}
 
-            if r_bin not in return_bin_groups:
-                return_bin_groups[r_bin] = []
-            if v_bin not in vol_bin_groups:
-                vol_bin_groups[v_bin] = []
+        unique_bins = np.unique(return_bins_array)
+        for bin_id in unique_bins:
+            mask = return_bins_array == bin_id
+            return_bin_groups[bin_id] = np.where(mask)[0]
 
-            return_bin_groups[r_bin].append(i)
-            vol_bin_groups[v_bin].append(i)
+        unique_bins = np.unique(vol_bins_array)
+        for bin_id in unique_bins:
+            mask = vol_bins_array == bin_id
+            vol_bin_groups[bin_id] = np.where(mask)[0]
 
         anchor_indices = []
         positive_indices = []
         negative_indices = []
 
-        for _ in range(n_triplets):
+        # Pre-compute list of available bins
+        return_bin_keys = list(return_bin_groups.keys())
+        vol_bin_keys = list(vol_bin_groups.keys())
+
+        # Log progress every 1000 triplets
+        log_interval = max(1, n_triplets // 10)
+
+        for i in range(n_triplets):
+            if i % log_interval == 0 and i > 0:
+                logger.info(f"  Mining progress: {i}/{n_triplets} triplets")
             # Random anchor
             anchor_idx = np.random.randint(0, n_samples)
 
@@ -119,35 +131,29 @@ class BinningStrategy(TripletMiningStrategy):
             if np.random.rand() < 0.5:
                 # Use return similarity
                 anchor_bin = return_bins[anchor_idx]
-                same_bin_samples = return_bin_groups.get(anchor_bin, [])
+                same_bin_samples = return_bin_groups.get(anchor_bin, np.array([]))
 
-                # Get different bin for negative
-                different_bins = [
-                    b for b in return_bin_groups.keys() if b != anchor_bin
-                ]
+                # Get different bin for negative (use numpy)
+                different_bins = [b for b in return_bin_keys if b != anchor_bin]
             else:
                 # Use volatility similarity
                 anchor_bin = vol_bins[anchor_idx]
-                same_bin_samples = vol_bin_groups.get(anchor_bin, [])
+                same_bin_samples = vol_bin_groups.get(anchor_bin, np.array([]))
 
                 # Get different bin for negative
-                different_bins = [
-                    b for b in vol_bin_groups.keys() if b != anchor_bin
-                ]
+                different_bins = [b for b in vol_bin_keys if b != anchor_bin]
 
             if len(same_bin_samples) < 2 or len(different_bins) == 0:
-                # Skip this triplet (not enough valid samples)
+                # Skip this triplet
                 continue
 
-            # Sample positive from same bin (different from anchor, preferably different asset)
-            valid_positives = [
-                idx for idx in same_bin_samples
-                if idx != anchor_idx and asset_ids[idx] != asset_ids[anchor_idx]
-            ]
+            # Sample positive from same bin (use boolean indexing - much faster)
+            mask = (same_bin_samples != anchor_idx) & (asset_ids_array[same_bin_samples] != asset_ids_array[anchor_idx])
+            valid_positives = same_bin_samples[mask]
 
             if len(valid_positives) == 0:
                 # Fallback to any sample from same bin
-                valid_positives = [idx for idx in same_bin_samples if idx != anchor_idx]
+                valid_positives = same_bin_samples[same_bin_samples != anchor_idx]
 
             if len(valid_positives) == 0:
                 continue
@@ -162,11 +168,9 @@ class BinningStrategy(TripletMiningStrategy):
             else:
                 different_bin_samples = vol_bin_groups[neg_bin]
 
-            # Prefer different asset for negative
-            valid_negatives = [
-                idx for idx in different_bin_samples
-                if asset_ids[idx] != asset_ids[anchor_idx]
-            ]
+            # Prefer different asset for negative (use boolean indexing)
+            mask = asset_ids_array[different_bin_samples] != asset_ids_array[anchor_idx]
+            valid_negatives = different_bin_samples[mask]
 
             if len(valid_negatives) == 0:
                 valid_negatives = different_bin_samples
