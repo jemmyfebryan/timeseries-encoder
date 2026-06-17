@@ -22,7 +22,7 @@ from training.config import Config
 from training.data import DataLoader
 from training.dataset import create_triplet_datasets
 from training.model import create_model
-from training.train import train_model, Trainer
+from training.train import train_model
 from training.inference import create_memory_bank, KNNInference, MemoryBank
 from training.utils import setup_logging, set_seed
 
@@ -173,16 +173,8 @@ def main():
     if args.mode in ["train", "full"]:
         logger.info("Starting training...")
 
-        # Load checkpoint if specified
-        if args.checkpoint:
-            checkpoint_path = Path(args.checkpoint)
-            if checkpoint_path.exists():
-                trainer = Trainer(model, train_dataset, val_dataset, config)
-                trainer.load_checkpoint(checkpoint_path)
-                logger.info(f"Resumed from checkpoint: {checkpoint_path}")
-
-        # Train
-        train_model(model, train_dataset, val_dataset, config)
+        # Train (with optional checkpoint resume)
+        train_model(model, train_dataset, val_dataset, config, checkpoint_path=args.checkpoint)
 
         logger.info("Training completed!")
 

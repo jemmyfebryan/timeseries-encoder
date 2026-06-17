@@ -16,6 +16,7 @@ import logging
 import time
 from datetime import datetime
 import numpy as np
+from tqdm import tqdm
 
 from .config import Config, TrainingConfig, TripletConfig
 from .model import DualHeadSiameseTCN
@@ -149,6 +150,15 @@ class Trainer:
 
         total_loss = return_loss + volatility_loss
 
+        # Compute distances for monitoring
+        # Positive distance: anchor to positive
+        pos_return_dist = 1 - torch.sum(anchor_return_emb * pos_return_emb, dim=1).mean()
+        pos_vol_dist = 1 - torch.sum(anchor_vol_emb * pos_vol_emb, dim=1).mean()
+
+        # Negative distance: anchor to negative
+        neg_return_dist = 1 - torch.sum(anchor_return_emb * neg_return_emb, dim=1).mean()
+        neg_vol_dist = 1 - torch.sum(anchor_vol_emb * neg_vol_emb, dim=1).mean()
+
         # Backward pass
         self.optimizer.zero_grad()
         total_loss.backward()
@@ -158,7 +168,15 @@ class Trainer:
 
         self.optimizer.step()
 
-        return return_loss, volatility_loss, total_loss
+        return (
+            return_loss,
+            volatility_loss,
+            total_loss,
+            pos_return_dist,
+            pos_vol_dist,
+            neg_return_dist,
+            neg_vol_dist,
+        )
 
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
@@ -205,7 +223,7 @@ class Trainer:
 
     def train_epoch(self) -> Dict[str, float]:
         """
-        Train for one epoch.
+        Train for one epoch with progress bar and per-batch metrics.
 
         Returns:
             Dictionary of training metrics
@@ -215,15 +233,45 @@ class Trainer:
         return_losses = []
         volatility_losses = []
         total_losses = []
+        pos_return_dists = []
+        pos_vol_dists = []
+        neg_return_dists = []
+        neg_vol_dists = []
 
         start_time = time.time()
 
-        for batch_idx, batch in enumerate(self.train_loader):
-            return_loss, volatility_loss, total_loss = self.train_step(batch)
+        # Create progress bar
+        pbar = tqdm(
+            self.train_loader,
+            desc=f"Epoch {self.current_epoch + 1}/{self.train_config.num_epochs}",
+            leave=False,
+        )
+
+        for batch_idx, batch in enumerate(pbar):
+            (
+                return_loss,
+                volatility_loss,
+                total_loss,
+                pos_return_dist,
+                pos_vol_dist,
+                neg_return_dist,
+                neg_vol_dist,
+            ) = self.train_step(batch)
 
             return_losses.append(return_loss.item())
             volatility_losses.append(volatility_loss.item())
             total_losses.append(total_loss.item())
+            pos_return_dists.append(pos_return_dist.item())
+            pos_vol_dists.append(pos_vol_dist.item())
+            neg_return_dists.append(neg_return_dist.item())
+            neg_vol_dists.append(neg_vol_dist.item())
+
+            # Update progress bar with current metrics
+            pbar.set_postfix({
+                "loss": f"{total_loss.item():.4f}",
+                "pos_dist": f"{((pos_return_dist + pos_vol_dist) / 2).item():.3f}",
+                "neg_dist": f"{((neg_return_dist + neg_vol_dist) / 2).item():.3f}",
+            })
 
             # Log to TensorBoard
             if self.global_step % self.train_config.log_interval == 0:
@@ -231,15 +279,31 @@ class Trainer:
                 self.writer.add_scalar("train/volatility_loss", volatility_loss.item(), self.global_step)
                 self.writer.add_scalar("train/total_loss", total_loss.item(), self.global_step)
                 self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]["lr"], self.global_step)
+                self.writer.add_scalar("train/pos_return_dist", pos_return_dist.item(), self.global_step)
+                self.writer.add_scalar("train/pos_vol_dist", pos_vol_dist.item(), self.global_step)
+                self.writer.add_scalar("train/neg_return_dist", neg_return_dist.item(), self.global_step)
+                self.writer.add_scalar("train/neg_vol_dist", neg_vol_dist.item(), self.global_step)
 
             self.global_step += 1
 
+        pbar.close()
+
         epoch_time = time.time() - start_time
+
+        # Compute metrics
+        avg_pos_return_dist = np.mean(pos_return_dists)
+        avg_pos_vol_dist = np.mean(pos_vol_dists)
+        avg_neg_return_dist = np.mean(neg_return_dists)
+        avg_neg_vol_dist = np.mean(neg_vol_dists)
 
         metrics = {
             "train_return_loss": np.mean(return_losses),
             "train_volatility_loss": np.mean(volatility_losses),
             "train_total_loss": np.mean(total_losses),
+            "train_pos_return_dist": avg_pos_return_dist,
+            "train_pos_vol_dist": avg_pos_vol_dist,
+            "train_neg_return_dist": avg_neg_return_dist,
+            "train_neg_vol_dist": avg_neg_vol_dist,
             "epoch_time": epoch_time,
         }
 
@@ -304,6 +368,8 @@ class Trainer:
                 f"Epoch {epoch + 1}/{self.train_config.num_epochs} - "
                 f"Train Loss: {train_metrics['train_total_loss']:.4f} - "
                 f"Val Loss: {val_metrics['val_total_loss']:.4f} - "
+                f"Pos Dist: {((train_metrics['train_pos_return_dist'] + train_metrics['train_pos_vol_dist']) / 2):.3f} - "
+                f"Neg Dist: {((train_metrics['train_neg_return_dist'] + train_metrics['train_neg_vol_dist']) / 2):.3f} - "
                 f"Time: {train_metrics['epoch_time']:.1f}s"
             )
 
@@ -314,6 +380,10 @@ class Trainer:
             self.writer.add_scalar("epoch/train_volatility_loss", train_metrics["train_volatility_loss"], epoch)
             self.writer.add_scalar("epoch/val_return_loss", val_metrics["val_return_loss"], epoch)
             self.writer.add_scalar("epoch/val_volatility_loss", val_metrics["val_volatility_loss"], epoch)
+            self.writer.add_scalar("epoch/train_pos_return_dist", train_metrics["train_pos_return_dist"], epoch)
+            self.writer.add_scalar("epoch/train_pos_vol_dist", train_metrics["train_pos_vol_dist"], epoch)
+            self.writer.add_scalar("epoch/train_neg_return_dist", train_metrics["train_neg_return_dist"], epoch)
+            self.writer.add_scalar("epoch/train_neg_vol_dist", train_metrics["train_neg_vol_dist"], epoch)
 
             # Update scheduler
             if self.scheduler is not None:
@@ -346,6 +416,7 @@ def train_model(
     train_dataset: TripletDataset,
     val_dataset: TripletDataset,
     config: Config,
+    checkpoint_path: Optional[str] = None,
 ) -> None:
     """
     Train the Dual-Head Siamese TCN model.
@@ -355,6 +426,13 @@ def train_model(
         train_dataset: Training dataset
         val_dataset: Validation dataset
         config: Configuration
+        checkpoint_path: Optional path to checkpoint for resuming training
     """
     trainer = Trainer(model, train_dataset, val_dataset, config)
+
+    # Load checkpoint if provided
+    if checkpoint_path and Path(checkpoint_path).exists():
+        trainer.load_checkpoint(Path(checkpoint_path))
+        logger.info(f"Resumed training from checkpoint: {checkpoint_path}")
+
     trainer.train()
